@@ -55,6 +55,10 @@ services:
       ClickHouse__Username: default
       ClickHouse__Password: ""
       ClickHouse__Database: bionic_reports
+      Keycloak__Authority: http://keycloak:8080
+      Keycloak__Realm: reports-realm
+      Keycloak__Audience: reports-api
+      Keycloak__RequireHttpsMetadata: "false"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/api/reports/health"]
       interval: 30s
@@ -62,7 +66,10 @@ services:
       retries: 3
       start_period: 10s
     networks:
+      - default
       - airflow_bionic-etl-network
+    depends_on:
+      - keycloak
     restart: unless-stopped
 
 networks:

@@ -1,5 +1,6 @@
 using BionicPRO.Api.Models;
 using BionicPRO.Api.Services;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace BionicPRO.Api.Controllers;
@@ -13,13 +14,16 @@ namespace BionicPRO.Api.Controllers;
 public class ReportsController : ControllerBase
 {
     private readonly IReportsService _reportsService;
+    private readonly IProsthesisAuthorizationService _prosthesisAuthService;
     private readonly ILogger<ReportsController> _logger;
 
     public ReportsController(
         IReportsService reportsService,
+        IProsthesisAuthorizationService prosthesisAuthService,
         ILogger<ReportsController> logger)
     {
         _reportsService = reportsService;
+        _prosthesisAuthService = prosthesisAuthService;
         _logger = logger;
     }
 
@@ -32,11 +36,16 @@ public class ReportsController : ControllerBase
     /// <returns>Список отчётов пользователя</returns>
     /// <response code="200">Отчёты успешно получены</response>
     /// <response code="400">Неверный формат параметров</response>
+    /// <response code="401">Пользователь не аутентифицирован</response>
+    /// <response code="403">Доступ запрещён (пользователь пытается получить чужие данные)</response>
     /// <response code="404">Отчёты не найдены</response>
     /// <response code="500">Внутренняя ошибка сервера</response>
     [HttpGet("user/{userId:guid}")]
+    [Authorize(Policy = "UserOwnsResource")]
     [ProducesResponseType(typeof(List<UserProsthesisReport>), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<ActionResult<List<UserProsthesisReport>>> GetReportsByUserId(
@@ -46,7 +55,10 @@ public class ReportsController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("GET /api/reports/user/{UserId} called", userId);
+            var systemUserId = User.FindFirst("system_user_id")?.Value;
+            _logger.LogInformation(
+                "GET /api/reports/user/{UserId} called by user {SystemUserId}",
+                userId, systemUserId);
 
             DateOnly? parsedStartDate = null;
             DateOnly? parsedEndDate = null;
@@ -92,10 +104,15 @@ public class ReportsController : ControllerBase
     /// <param name="userId">ID пользователя</param>
     /// <returns>Последний отчёт пользователя</returns>
     /// <response code="200">Отчёт успешно получен</response>
+    /// <response code="401">Пользователь не аутентифицирован</response>
+    /// <response code="403">Доступ запрещён</response>
     /// <response code="404">Отчёт не найден</response>
     /// <response code="500">Внутренняя ошибка сервера</response>
     [HttpGet("user/{userId:guid}/latest")]
+    [Authorize(Policy = "UserOwnsResource")]
     [ProducesResponseType(typeof(UserProsthesisReport), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<ActionResult<UserProsthesisReport>> GetLatestReportByUserId(
@@ -103,7 +120,10 @@ public class ReportsController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("GET /api/reports/user/{UserId}/latest called", userId);
+            var systemUserId = User.FindFirst("system_user_id")?.Value;
+            _logger.LogInformation(
+                "GET /api/reports/user/{UserId}/latest called by user {SystemUserId}",
+                userId, systemUserId);
 
             var report = await _reportsService.GetLatestReportByUserIdAsync(userId);
 
@@ -130,11 +150,16 @@ public class ReportsController : ControllerBase
     /// <returns>Список отчётов протеза</returns>
     /// <response code="200">Отчёты успешно получены</response>
     /// <response code="400">Неверный формат параметров</response>
+    /// <response code="401">Пользователь не аутентифицирован</response>
+    /// <response code="403">Доступ запрещён (протез не принадлежит пользователю)</response>
     /// <response code="404">Отчёты не найдены</response>
     /// <response code="500">Внутренняя ошибка сервера</response>
     [HttpGet("prosthesis/{prosthesisId:guid}")]
+    [Authorize(Roles = "prothetic_user,administrator")]
     [ProducesResponseType(typeof(List<UserProsthesisReport>), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<ActionResult<List<UserProsthesisReport>>> GetReportsByProsthesisId(
@@ -144,7 +169,30 @@ public class ReportsController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("GET /api/reports/prosthesis/{ProsthesisId} called", prosthesisId);
+            var systemUserIdClaim = User.FindFirst("system_user_id")?.Value;
+            if (systemUserIdClaim == null || !Guid.TryParse(systemUserIdClaim, out var systemUserId))
+            {
+                return Unauthorized(new { error = "system_user_id claim missing or invalid" });
+            }
+
+            var isAdmin = User.IsInRole("administrator");
+
+            _logger.LogInformation(
+                "GET /api/reports/prosthesis/{ProsthesisId} called by user {SystemUserId} (admin: {IsAdmin})",
+                prosthesisId, systemUserId, isAdmin);
+
+            // Проверяем, принадлежит ли протез пользователю (если не администратор)
+            if (!isAdmin)
+            {
+                var owns = await _prosthesisAuthService.UserOwnsProsthesisAsync(systemUserId, prosthesisId);
+                if (!owns)
+                {
+                    _logger.LogWarning(
+                        "User {SystemUserId} attempted to access prosthesis {ProsthesisId} they don't own",
+                        systemUserId, prosthesisId);
+                    return Forbid();
+                }
+            }
 
             DateOnly? parsedStartDate = null;
             DateOnly? parsedEndDate = null;
@@ -189,6 +237,7 @@ public class ReportsController : ControllerBase
     /// </summary>
     /// <returns>Статус сервиса</returns>
     [HttpGet("health")]
+    [AllowAnonymous]
     [ProducesResponseType(StatusCodes.Status200OK)]
     public IActionResult Health()
     {
