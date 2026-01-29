@@ -40,3 +40,31 @@ services:
       REACT_APP_KEYCLOAK_URL: http://localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+
+  bionicpro-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: bionicpro-api
+    ports:
+      - "5000:5000"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ClickHouse__Host: clickhouse
+      ClickHouse__Port: 8123
+      ClickHouse__Username: default
+      ClickHouse__Password: ""
+      ClickHouse__Database: bionic_reports
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/reports/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - airflow_bionic-etl-network
+    restart: unless-stopped
+
+networks:
+  airflow_bionic-etl-network:
+    external: true
