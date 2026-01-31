@@ -9,6 +9,7 @@ docker compose up -d
 ### Запуск API + Frontend + Auth
 
 ```bash
+cd ..
 docker compose up -d
 ```
 
