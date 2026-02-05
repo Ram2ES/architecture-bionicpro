@@ -1,0 +1,212 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 30
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+
+    AIRFLOW_VAR_CLICKHOUSE_HOST: clickhouse
+    AIRFLOW_VAR_CLICKHOUSE_PORT: '9000'
+    AIRFLOW_VAR_CLICKHOUSE_USER: default
+    AIRFLOW_VAR_CLICKHOUSE_PASSWORD: ''
+
+    AIRFLOW__SMTP__SMTP_HOST: ''
+    AIRFLOW__SMTP__SMTP_PORT: 587
+    _PIP_ADDITIONAL_REQUIREMENTS: 'clickhouse-driver==0.2.10'
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./logs:/opt/airflow/logs
+    - ./sql:/opt/airflow/sql
+    - ./requirements.txt:/requirements.txt
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+  networks:
+    - bionic-etl-network
+
+services:
+  airflow-postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - bionic-etl-network
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@bionicpro.com \
+          --password admin
+        airflow connections add 'postgres_sensors' \
+          --conn-type 'postgres' \
+          --conn-host 'sensors-postgres' \
+          --conn-schema 'sensors_db' \
+          --conn-login 'sensors_user' \
+          --conn-password 'sensors_password' \
+          --conn-port '5432' || true
+        airflow connections add 'clickhouse_default' \
+          --conn-type 'generic' \
+          --conn-host 'clickhouse' \
+          --conn-port '9000' \
+          --conn-login 'default' || true
+        airflow connections add 'postgres_crm' \
+          --conn-type 'postgres' \
+          --conn-host 'crm-postgres' \
+          --conn-schema 'crm_db' \
+          --conn-login 'crm_user' \
+          --conn-password 'crm_password' \
+          --conn-port '5432' || true
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./sql:/sql
+    environment:
+      CLICKHOUSE_DB: bionic_reports
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bionic-etl-network
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:24.1
+    volumes:
+      - ./sql:/sql
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - bionic-etl-network
+    entrypoint: >
+      bash -c "
+      echo 'Waiting for ClickHouse to be ready...' &&
+      sleep 5 &&
+      clickhouse-client --host clickhouse --multiquery < /sql/create_clickhouse_tables.sql &&
+      echo 'ClickHouse tables created successfully!'
+      "
+
+  sensors-postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: sensors_user
+      POSTGRES_PASSWORD: sensors_password
+      POSTGRES_DB: sensors_db
+    volumes:
+      - sensors-postgres-data:/var/lib/postgresql/data
+      - ./init-sensors-db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "sensors_user", "-d", "sensors_db"]
+      interval: 10s
+      retries: 5
+    networks:
+      - bionic-etl-network
+
+  crm-postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+      POSTGRES_DB: crm_db
+    volumes:
+      - crm-postgres-data:/var/lib/postgresql/data
+      - ./init-crm-db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "crm_user", "-d", "crm_db"]
+      interval: 10s
+      retries: 5
+    networks:
+      - bionic-etl-network
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bionic-etl-network
+
+networks:
+  bionic-etl-network:
+    driver: bridge
+
+volumes:
+  airflow-postgres-data:
+  clickhouse-data:
+  sensors-postgres-data:
+  crm-postgres-data:
